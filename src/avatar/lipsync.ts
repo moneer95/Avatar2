@@ -1,8 +1,24 @@
 import type { AlignmentSegment, AudioPacket } from "./types";
-import type { WordTimingPlan } from "./visemeMap";
 
-export type { VisemeTrack, WordTimingPlan } from "./visemeMap";
-export { buildVisemeTrack, charToViseme, wordToVisemes } from "./visemeMap";
+export interface WordTimingPlan {
+  words: string[];
+  wtimes: number[];
+  wdurations: number[];
+}
+
+/** True when the sender included all three timing arrays (mouth-sync contract). */
+export function hasDirectWordTimings(
+  packet: Pick<AudioPacket, "words" | "wtimes" | "wdurations">,
+): boolean {
+  const { words, wtimes, wdurations } = packet;
+  return Boolean(
+    words?.length &&
+      wtimes?.length &&
+      wdurations?.length &&
+      words.length === wtimes.length &&
+      words.length === wdurations.length,
+  );
+}
 
 /** Resolve word timings from Audiofish fields (or build from alignment / text). */
 export function resolveWordTimings(
@@ -35,7 +51,15 @@ export function normalizeWordTimingsMs(
 ): { wtimes: number[]; wdurations: number[] } {
   if (!wtimes.length) return { wtimes: [], wdurations: [] };
   const last = wtimes[wtimes.length - 1]! + wdurations[wdurations.length - 1]!;
-  if (last > 0 && last < 180 && audioMs > last * 4) {
+  const maxT = Math.max(...wtimes, last);
+
+  // Chunk-relative seconds (e.g. 0, 0.4, 1.2) while audioMs is thousands.
+  const looksLikeSeconds =
+    maxT > 0 &&
+    maxT < 600 &&
+    audioMs > maxT * 500;
+
+  if (looksLikeSeconds) {
     return {
       wtimes: wtimes.map((t) => t * 1000),
       wdurations: wdurations.map((d) => d * 1000),
@@ -65,7 +89,7 @@ export function rebaseWordTimingsToChunk(
   }
 
   const rebasedMin = Math.min(...t);
-  if (rebasedMin > 5 && rebasedMin > audioMs * 0.25) {
+  if (rebasedMin > 1) {
     t = t.map((x) => x - rebasedMin);
   }
 

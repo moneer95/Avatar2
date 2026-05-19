@@ -1,16 +1,22 @@
 import { TalkingHead, type SpeakAudioPayload } from "talkinghead";
+import { LipsyncEn } from "talkinghead/modules/lipsync-en.mjs";
 import { ASSETS, type ClipName } from "./assets";
-import {
-  buildVisemeTrack,
-  resolveWordTimings,
-  type VisemeTrack,
-  type WordTimingPlan,
-} from "./lipsync";
+import { resolveWordTimings, type WordTimingPlan } from "./lipsync";
 import { MorphDriver } from "./morphDriver";
 
-// AvatarEngine wraps TalkingHead so the rest of the app sees a small, stable
-// surface: load the avatar, switch clips, queue speech, tear down. It owns the
-// "what is the avatar doing right now?" state machine in one place.
+const PCM_SAMPLE_RATE = 22050;
+const SILENT_PCM_PAD_MS = 50;
+const LIP_DEBUG =
+  import.meta.env.DEV || import.meta.env.VITE_LIPSYNC_DEBUG === "1";
+
+function lipDebug(message: string, details?: unknown): void {
+  if (!LIP_DEBUG) return;
+  if (details === undefined) {
+    console.log(`[lipdebug][engine] ${message}`);
+    return;
+  }
+  console.log(`[lipdebug][engine] ${message}`, details);
+}
 
 export type EngineMood =
   | "neutral"
@@ -36,14 +42,11 @@ export interface EngineInitOptions {
   pixelRatio?: number;
 }
 
-interface QueueItem {
+export interface QueueItem {
   audio: AudioBuffer;
   durationMs: number;
-  lipTrack?: VisemeTrack;
-  /** Word timings for Live Caption (not sent to TalkingHead). */
-  captionPlan?: WordTimingPlan;
+  wordPlan?: WordTimingPlan;
 }
-
 
 const DEFAULTS: Required<EngineInitOptions> = {
   mood: "neutral",
@@ -57,8 +60,6 @@ export class AvatarEngine {
   private container: HTMLElement;
   private events: EngineEvents;
   private currentClip: ClipName | null = null;
-  // Speech is tracked by a counter rather than booleans so that overlapping
-  // enqueue/finish callbacks can never desync.
   private outstanding = 0;
   private destroyed = false;
   private audioCtx: AudioContext | null = null;
@@ -69,20 +70,19 @@ export class AvatarEngine {
     this.events = events;
   }
 
-  // ---------------------------------------------------------------------------
-  // Lifecycle
-  // ---------------------------------------------------------------------------
-
   async init(opts: EngineInitOptions = {}): Promise<void> {
     const o = { ...DEFAULTS, ...opts };
-    // A prior instance may have been destroyed (React Strict Mode runs effects
-    // twice in dev). Allow a fresh init on the same engine object.
     this.destroyed = false;
 
+    this.audioCtx = this.createAudioContext();
+    lipDebug("init: audio context created", {
+      state: this.audioCtx.state,
+      sampleRate: this.audioCtx.sampleRate,
+    });
+
     this.head = new TalkingHead(this.container, {
-      // No Google Cloud TTS URL — Make Speak uses the browser speech API instead
-      // (see speakText). Do not set ttsEndpoint to null: TalkingHead stringifies
-      // it and POSTs to "/null".
+      audioCtx: this.audioCtx,
+      pcmSampleRate: PCM_SAMPLE_RATE,
       ttsEndpoint: "",
       ttsTrimStart: 0,
       ttsTrimEnd: 0,
@@ -98,14 +98,21 @@ export class AvatarEngine {
       modelFPS: o.fps,
       dracoEnabled: true,
     });
+
+    this.ensureLipsync();
+    this.logLipsyncReadiness("before-showAvatar");
+
     await this.head.showAvatar({
       url: ASSETS.avatarUrl,
       body: "M",
       avatarMood: o.mood,
       lipsyncLang: "en",
     });
-    // Boot idle once the model is in. Skip if teardown already ran (Strict Mode
-    // cleanup can finish before this async init does).
+
+    this.ensureLipsync();
+    this.attachMorphDriver();
+    this.logLipsyncReadiness("after-showAvatar");
+
     if (!this.destroyed && this.head) {
       void this.playClip("idle", { loop: true });
     }
@@ -114,7 +121,8 @@ export class AvatarEngine {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.morphDriver.stop();
+    this.morphDriver.detach();
+    lipDebug("destroy: begin teardown");
     try {
       this.head?.stopSpeaking();
     } catch {
@@ -125,16 +133,11 @@ export class AvatarEngine {
     } catch {
       /* noop */
     }
-    if (this.audioCtx && this.audioCtx.state !== "closed") {
-      void this.audioCtx.close().catch(() => undefined);
-    }
+    // Do not close here: TalkingHead may still run async resume/suspend calls
+    // during teardown, which can throw on a closed context in Strict Mode.
     this.audioCtx = null;
     this.head = null;
   }
-
-  // ---------------------------------------------------------------------------
-  // Animation clips
-  // ---------------------------------------------------------------------------
 
   async playClip(
     name: ClipName,
@@ -146,19 +149,13 @@ export class AvatarEngine {
     if (!url) throw new Error(`Unknown clip: ${name}`);
 
     this.currentClip = name;
-
-    // TalkingHead.playAnimation crossfades automatically. Passing a numeric
-    // duration in seconds caps the clip; omit for natural loops.
     const dur = opts.durationMs ? opts.durationMs / 1000 : undefined;
     await head.playAnimation(url, undefined, dur, 0, 1);
 
-    // For one-shot clips (e.g. wave), schedule a return-to-idle once the clip
-    // ends. TalkingHead itself doesn't fire a "clip ended" event publicly, so
-    // we rely on the duration we asked for.
     if (!opts.loop && dur && name !== "idle") {
       window.setTimeout(() => {
         if (this.destroyed) return;
-        if (this.currentClip !== name) return; // user switched away
+        if (this.currentClip !== name) return;
         void this.playClip("idle", { loop: true });
       }, dur * 1000);
     }
@@ -168,23 +165,16 @@ export class AvatarEngine {
     return this.currentClip;
   }
 
-  /** Show full sentence in the Live Caption panel. */
   showCaption(text: string): void {
     this.events.onSubtitle?.(text);
   }
 
-  // Wave gesture — uses the wave clip if available, then blends back to idle.
   async wave(durationMs = 2600): Promise<void> {
     await this.playClip("wave", { durationMs });
   }
 
-  // ---------------------------------------------------------------------------
-  // Speech: browser TTS (Phase 1)
-  // ---------------------------------------------------------------------------
-
   async speakText(text: string): Promise<void> {
     if (this.destroyed || !this.head) return;
-    const head = this.head;
     const trimmed = text.trim();
     if (!trimmed) return;
     this.beginSpeech();
@@ -192,22 +182,16 @@ export class AvatarEngine {
       const estimatedMs = Math.max(1200, trimmed.length * 50);
       const plan = resolveWordTimings({ caption: trimmed }, estimatedMs);
 
-      if (plan) {
-        const track = buildVisemeTrack(plan);
-        const silent = await this.createSilentBuffer(estimatedMs / 1000);
-        this.morphDriver.scheduleCaptions(plan, (word) =>
-          this.events.onSubtitle?.(word),
-        );
-        this.speakAudioWithVisemes(head, silent, track, estimatedMs);
-      }
+      const speakPromise = plan
+        ? this.speakWithWordTimings(plan, estimatedMs)
+        : Promise.resolve();
 
-      await this.browserSpeak(trimmed);
+      await Promise.all([speakPromise, this.browserSpeak(trimmed)]);
     } finally {
       this.endSpeech();
     }
   }
 
-  /** Web Speech API — Phase 1 local TTS (no network). */
   private browserSpeak(text: string): Promise<void> {
     return new Promise((resolve, reject) => {
       const synth = window.speechSynthesis;
@@ -220,7 +204,6 @@ export class AvatarEngine {
       utter.lang = "en-US";
       utter.onend = () => resolve();
       utter.onerror = (event) => {
-        // "interrupted" fires when the user hits Stop — treat as a clean end.
         if (event.error === "interrupted") {
           resolve();
           return;
@@ -231,113 +214,190 @@ export class AvatarEngine {
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Speech: word-timed audio packets (Phase 2)
-  // ---------------------------------------------------------------------------
-
-  // Enqueue a fully-decoded payload. The audio queue (see audioQueue.ts) calls
-  // this; consumers should normally not call it directly.
   enqueueDecodedAudio(item: QueueItem): void {
     if (this.destroyed || !this.head) return;
-    const head = this.head;
-
     this.beginSpeech();
+    this.ensureLipsync();
+    lipDebug("enqueueDecodedAudio", {
+      durationMs: item.durationMs,
+      hasWordPlan: Boolean(item.wordPlan?.words.length),
+      words: item.wordPlan?.words.length ?? 0,
+      firstWord: item.wordPlan?.words[0] ?? null,
+      audioCtxState: this.audioCtx?.state ?? "none",
+    });
 
-    if (item.captionPlan?.words.length) {
-      this.morphDriver.scheduleCaptions(item.captionPlan, (word) =>
-        this.events.onSubtitle?.(word),
-      );
-    }
-
-    if (item.lipTrack?.visemes.length) {
-      this.speakAudioWithVisemes(
-        head,
+    if (item.wordPlan?.words.length) {
+      this.speakWordTimedAudio(
         item.audio,
-        item.lipTrack,
+        item.wordPlan,
         item.durationMs,
         () => this.endSpeech(),
       );
       return;
     }
 
-    head.speakAudio(
-      {
-        audio: item.audio,
-        ...this.thWordsGate(item.durationMs),
-        markers: [() => this.endSpeech()],
-        mtimes: [Math.max(0, item.durationMs - 10)],
-      },
-      { isRaw: true },
-    );
+    this.head.speakAudio({ audio: item.audio }, { lipsyncLang: "en", isRaw: true });
+    window.setTimeout(() => this.endSpeech(), item.durationMs);
   }
 
   /**
-   * TalkingHead only runs visemes / markers inside `if (r.words)`.
-   * It always reads `wtimes[i]` / `wdurations[i]` — they must exist.
-   * A single space skips text lipsync when `visemes` are supplied.
+   * Word timings → English lipsync + captions via TalkingHead (same clock as audio).
+   * isRaw: skip resetLips / gesture so streamed chunks keep the mouth pose.
    */
-  private thWordsGate(
-    durationMs: number,
-  ): Pick<SpeakAudioPayload, "words" | "wtimes" | "wdurations"> {
-    return {
-      words: [" "],
-      wtimes: [0],
-      wdurations: [Math.max(1, durationMs)],
-    };
-  }
-
-  /** Drive mouth via TalkingHead viseme animations (no lipsync module). */
-  private speakAudioWithVisemes(
-    head: TalkingHead,
-    audio: AudioBuffer,
-    track: VisemeTrack,
+  private speakWordTimedAudio(
+    audio: AudioBuffer | ArrayBuffer | ArrayBuffer[],
+    plan: WordTimingPlan,
     durationMs: number,
     onEnd?: () => void,
   ): void {
-    const n = track.visemes.length;
+    if (!this.head) return;
+    const sample = Math.min(3, plan.words.length);
+    const timelineEnd =
+      plan.words.length > 0
+        ? plan.wtimes[plan.words.length - 1]! +
+          plan.wdurations[plan.words.length - 1]!
+        : 0;
+    lipDebug("speakWordTimedAudio payload", {
+      words: plan.words.length,
+      firstWords: plan.words.slice(0, sample),
+      firstWTimes: plan.wtimes.slice(0, sample),
+      firstWDurations: plan.wdurations.slice(0, sample),
+      timelineEndMs: timelineEnd,
+      durationMs,
+      lipsyncLoaded: Boolean(
+        (this.head as { lipsync?: Record<string, unknown> }).lipsync?.en,
+      ),
+      audioType: Array.isArray(audio) ? "pcm-array" : "audio-buffer",
+    });
+
+    // We pass `words` so TalkingHead's marker callback (onEnd) still fires on
+    // its audio clock, but we also pass an empty `visemes` array so TH skips its
+    // built-in words→viseme generation. That leaves the mesh's
+    // morphTargetInfluences entirely under our MorphDriver — no race.
     const payload: SpeakAudioPayload = {
       audio,
-      ...this.thWordsGate(durationMs),
-      visemes: track.visemes,
-      vtimes: track.vtimes.slice(0, n),
-      vdurations: track.vdurations.slice(0, n),
+      words: plan.words,
+      wtimes: plan.wtimes,
+      wdurations: plan.wdurations,
+      visemes: [],
+      vtimes: [],
+      vdurations: [],
     };
     if (onEnd) {
       payload.markers = [onEnd];
       payload.mtimes = [Math.max(0, durationMs - 10)];
     }
-    head.speakAudio(payload, { isRaw: true });
+
+    this.head.speakAudio(payload, { lipsyncLang: "en" });
+
+    // Drive the actual mouth ourselves; TH's morph layer ramps too slowly for
+    // visemes on this model, so we write directly to mesh.morphTargetInfluences.
+    this.morphDriver.play(plan, durationMs, (word) => {
+      const t = word.trim();
+      if (!t) return;
+      lipDebug("driver word", { word: t });
+      this.events.onSubtitle?.(t);
+    });
   }
 
-  private async createSilentBuffer(durationSec: number): Promise<AudioBuffer> {
-    if (!this.audioCtx) {
-      const Ctor =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-      this.audioCtx = new Ctor();
+  private speakWithWordTimings(
+    plan: WordTimingPlan,
+    durationMs: number,
+  ): Promise<void> {
+    if (this.destroyed || !this.head) return Promise.resolve();
+    this.ensureLipsync();
+
+    return new Promise((resolve) => {
+      const pcm = this.createSilentPcm(durationMs);
+      this.speakWordTimedAudio([pcm], plan, durationMs, resolve);
+    });
+  }
+
+  private createSilentPcm(durationMs: number): ArrayBuffer {
+    const samples = Math.ceil(
+      ((durationMs + SILENT_PCM_PAD_MS) / 1000) * PCM_SAMPLE_RATE,
+    );
+    return new Int16Array(Math.max(1, samples)).buffer;
+  }
+
+  private ensureLipsync(): void {
+    if (!this.head) return;
+    if (!this.head.lipsync) {
+      this.head.lipsync = {};
     }
-    const sr = this.audioCtx.sampleRate;
-    const frames = Math.max(1, Math.ceil(durationSec * sr));
-    return this.audioCtx.createBuffer(1, frames, sr);
+    if (!this.head.lipsync.en) {
+      this.head.lipsync.en = new LipsyncEn();
+      lipDebug("ensureLipsync: loaded English lipsync processor");
+    }
   }
 
-  // Decode an ArrayBuffer (mp3/wav/opus/etc.) into an AudioBuffer using a
-  // shared AudioContext. Exposed so audioQueue can decode before enqueueing.
   async decodeAudio(buffer: ArrayBuffer): Promise<AudioBuffer> {
     if (!this.audioCtx) {
-      const Ctor =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-      this.audioCtx = new Ctor();
+      throw new Error("AvatarEngine: AudioContext not initialized");
+    }
+    if (this.audioCtx.state === "closed") {
+      throw new Error("AvatarEngine: AudioContext is closed");
     }
     if (this.audioCtx.state === "suspended") {
+      lipDebug("decodeAudio: resuming suspended context");
       await this.audioCtx.resume();
     }
-    // Some browsers mutate the input; copy to be safe.
-    const copy = buffer.slice(0);
-    return await this.audioCtx.decodeAudioData(copy);
+    const decoded = await this.audioCtx.decodeAudioData(buffer.slice(0));
+    lipDebug("decodeAudio: decoded", {
+      durationSec: decoded.duration,
+      sampleRate: decoded.sampleRate,
+      channels: decoded.numberOfChannels,
+    });
+    return decoded;
+  }
+
+  private createAudioContext(): AudioContext {
+    const Ctor =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    return new Ctor({ sampleRate: PCM_SAMPLE_RATE });
+  }
+
+  private logLipsyncReadiness(stage: string): void {
+    if (!this.head) return;
+    const headAny = this.head as {
+      lipsync?: Record<string, unknown>;
+      getMorphTargetNames?: () => string[];
+      mtAvatar?: Record<string, unknown>;
+      morphs?: Array<{
+        morphTargetDictionary?: Record<string, number>;
+      }>;
+    };
+    const mtKeys =
+      headAny.getMorphTargetNames?.() ?? Object.keys(headAny.mtAvatar ?? {});
+    const visemeKeys = mtKeys.filter((k) => k.toLowerCase().includes("viseme"));
+    const meshKeys = new Set<string>();
+    for (const m of headAny.morphs ?? []) {
+      for (const k of Object.keys(m.morphTargetDictionary ?? {})) meshKeys.add(k);
+    }
+    lipDebug(`lipsync readiness (${stage})`, {
+      lipsyncLangs: Object.keys(headAny.lipsync ?? {}),
+      hasEnglish: Boolean(headAny.lipsync?.en),
+      morphTargetsTotal: mtKeys.length,
+      visemeTargetsTotal: visemeKeys.length,
+      visemeTargetsSample: visemeKeys.slice(0, 12),
+      meshMorphsTotal: meshKeys.size,
+      meshMorphsHasVisemeAa: meshKeys.has("viseme_aa"),
+      meshMorphsSample: [...meshKeys].slice(0, 12),
+    });
+  }
+
+  private attachMorphDriver(): void {
+    if (!this.head) return;
+    const headAny = this.head as {
+      morphs?: Array<{
+        morphTargetDictionary?: Record<string, number>;
+        morphTargetInfluences?: number[];
+      }>;
+    };
+    const meshes = headAny.morphs ?? [];
+    this.morphDriver.attach(meshes);
   }
 
   stopSpeaking(): void {
@@ -352,26 +412,19 @@ export class AvatarEngine {
     } catch {
       /* noop */
     }
-    // Force-drain so UI doesn't think we're still speaking.
     if (this.outstanding > 0) {
       this.outstanding = 0;
       this.events.onQueueDrain?.();
-      // Drop the body back to idle.
       if (this.currentClip === "talk") {
         void this.playClip("idle", { loop: true });
       }
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Internals
-  // ---------------------------------------------------------------------------
-
   private beginSpeech(): void {
     this.outstanding += 1;
     if (this.outstanding === 1) {
       this.events.onSpeakStart?.();
-      // Body sync: talk animation starts when the queue starts playing.
       if (this.currentClip !== "talk") {
         void this.playClip("talk", { loop: true });
       }
@@ -382,11 +435,9 @@ export class AvatarEngine {
     this.outstanding = Math.max(0, this.outstanding - 1);
     if (this.outstanding === 0) {
       this.events.onQueueDrain?.();
-      // Body sync: return to idle when the queue drains.
       if (!this.destroyed && this.currentClip === "talk") {
         void this.playClip("idle", { loop: true });
       }
     }
   }
-
 }

@@ -11,6 +11,17 @@ import type { AudioPacket, AvatarStatus } from "../avatar/types";
 // Wires the avatar engine, ordered audio queue, and AudiofishTTS output socket.
 
 export type RelayStatus = TtsOutputStatus;
+const LIP_DEBUG =
+  import.meta.env.DEV || import.meta.env.VITE_LIPSYNC_DEBUG === "1";
+
+function lipDebug(message: string, details?: unknown): void {
+  if (!LIP_DEBUG) return;
+  if (details === undefined) {
+    console.log(`[lipdebug][hook] ${message}`);
+    return;
+  }
+  console.log(`[lipdebug][hook] ${message}`, details);
+}
 
 export interface UseAvatarOptions {
   wsUrl?: string;
@@ -126,6 +137,19 @@ export function useAvatar(opts: UseAvatarOptions = {}): UseAvatarReturn {
           queueRef.current?.onSessionOpen();
         },
         onAudio: (msg) => {
+          lipDebug("ws onAudio", {
+            seq: msg.chunk_seq ?? null,
+            offsetSec: msg.chunk_audio_offset_sec ?? null,
+            textChars: msg.text?.length ?? 0,
+            words: msg.words?.length ?? 0,
+            wtimes: msg.wtimes?.length ?? 0,
+            wdurations: msg.wdurations?.length ?? 0,
+            alignmentSegments: msg.alignment?.segments?.length ?? 0,
+            base64Chars: msg.audio_base64.length,
+            firstWords: msg.words?.slice(0, 3) ?? [],
+            firstWTimes: msg.wtimes?.slice(0, 3) ?? [],
+            firstWDurations: msg.wdurations?.slice(0, 3) ?? [],
+          });
           const packet: AudioPacket = {
             audio: base64ToArrayBuffer(msg.audio_base64),
             mime: mimeFromFormat(msg.format),

@@ -40,6 +40,9 @@ declare module "talkinghead" {
     modelFPS?: number;
     dracoEnabled?: boolean;
     dracoDecoderPath?: string;
+    /** Shared Web Audio context (must match decodeAudio / PCM playback). */
+    audioCtx?: AudioContext;
+    pcmSampleRate?: number;
     [key: string]: unknown;
   }
 

@@ -1,10 +1,21 @@
 import type { AvatarEngine } from "./engine";
 import type { AudioPacket } from "./types";
 import {
-  buildVisemeTrack,
   resolveWordTimings,
   scaleWordTimings,
 } from "./lipsync";
+
+const LIP_DEBUG =
+  import.meta.env.DEV || import.meta.env.VITE_LIPSYNC_DEBUG === "1";
+
+function lipDebug(message: string, details?: unknown): void {
+  if (!LIP_DEBUG) return;
+  if (details === undefined) {
+    console.log(`[lipdebug][queue] ${message}`);
+    return;
+  }
+  console.log(`[lipdebug][queue] ${message}`, details);
+}
 
 export class AudioQueue {
   private engine: AvatarEngine;
@@ -12,7 +23,6 @@ export class AudioQueue {
   private onError?: (err: unknown) => void;
 
   private sessionStartMs: number | null = null;
-  /** First chunk's Fish offset — rebased so the viewer starts playing immediately. */
   private timelineBaseOffsetSec = 0;
   private nextSeq = 0;
   private pending = new Map<number, AudioPacket>();
@@ -98,7 +108,6 @@ export class AudioQueue {
     this.onSizeChange?.(this.pending.size + this.scheduled);
   }
 
-  /** Release chunk_seq 0, 1, 2… as they become available (no blocking chain). */
   private releaseSequential(): void {
     while (this.pending.has(this.nextSeq)) {
       const packet = this.pending.get(this.nextSeq)!;
@@ -108,7 +117,6 @@ export class AudioQueue {
       this.schedulePacket(packet);
     }
 
-    // If we missed early chunks (viewer joined late), skip the gap.
     if (this.pending.size > 0) {
       const minKey = Math.min(...this.pending.keys());
       if (minKey > this.nextSeq) {
@@ -144,9 +152,16 @@ export class AudioQueue {
   }
 
   private async process(packet: AudioPacket): Promise<void> {
-    if (packet.caption?.trim()) {
-      this.engine.showCaption(packet.caption.trim());
-    }
+    lipDebug("process: packet received", {
+      seq: packet.chunk_seq ?? null,
+      offsetSec: packet.chunk_audio_offset_sec ?? null,
+      captionChars: packet.caption?.length ?? 0,
+      words: packet.words?.length ?? 0,
+      wtimes: packet.wtimes?.length ?? 0,
+      wdurations: packet.wdurations?.length ?? 0,
+      alignSegments: packet.alignment?.segments?.length ?? 0,
+      bytes: packet.audio.byteLength,
+    });
 
     const audioBuffer = await this.engine.decodeAudio(packet.audio);
     const audioMs = audioBuffer.duration * 1000;
@@ -156,28 +171,49 @@ export class AudioQueue {
       audioMs,
       packet.chunk_audio_offset_sec,
     );
-
     if (plan && plan.words.length > 0) {
-      const scaled = scaleWordTimings(plan.wtimes, plan.wdurations, audioMs);
-      const track = buildVisemeTrack({
-        words: plan.words,
-        wtimes: scaled.wtimes,
-        wdurations: scaled.wdurations,
+      const scaled = scaleWordTimings(
+        plan.wtimes,
+        plan.wdurations,
+        audioMs,
+      );
+      const sample = Math.min(3, plan.words.length);
+      const timelineEnd =
+        scaled.wtimes[scaled.wtimes.length - 1]! +
+        scaled.wdurations[scaled.wdurations.length - 1]!;
+      lipDebug("process: word plan resolved", {
+        source: packet.words?.length
+          ? "direct"
+          : packet.alignment?.segments?.length
+            ? "alignment"
+            : "caption-estimate",
+        audioMs,
+        words: plan.words.length,
+        firstWords: plan.words.slice(0, sample),
+        firstWTimesRaw: plan.wtimes.slice(0, sample),
+        firstWDurationsRaw: plan.wdurations.slice(0, sample),
+        firstWTimesScaled: scaled.wtimes.slice(0, sample),
+        firstWDurationsScaled: scaled.wdurations.slice(0, sample),
+        timelineEndScaledMs: timelineEnd,
       });
+      this.engine.enqueueDecodedAudio({
+        audio: audioBuffer,
+        durationMs: audioMs,
+        wordPlan: {
+          words: plan.words,
+          wtimes: scaled.wtimes,
+          wdurations: scaled.wdurations,
+        },
+      });
+      return;
+    }
 
-      if (track.visemes.length > 0) {
-        this.engine.enqueueDecodedAudio({
-          audio: audioBuffer,
-          durationMs: audioMs,
-          lipTrack: track,
-          captionPlan: {
-            words: plan.words,
-            wtimes: scaled.wtimes,
-            wdurations: scaled.wdurations,
-          },
-        });
-        return;
-      }
+    lipDebug("process: no word plan, audio-only fallback", {
+      audioMs,
+      hasCaption: Boolean(packet.caption?.trim()),
+    });
+    if (packet.caption?.trim()) {
+      this.engine.showCaption(packet.caption.trim());
     }
 
     this.engine.enqueueDecodedAudio({
