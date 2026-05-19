@@ -2,7 +2,6 @@ import { TalkingHead, type SpeakAudioPayload } from "talkinghead";
 import { LipsyncEn } from "talkinghead/modules/lipsync-en.mjs";
 import { ASSETS, type ClipName } from "./assets";
 import { resolveWordTimings, type WordTimingPlan } from "./lipsync";
-import { MorphDriver } from "./morphDriver";
 
 const PCM_SAMPLE_RATE = 22050;
 const SILENT_PCM_PAD_MS = 50;
@@ -63,7 +62,6 @@ export class AvatarEngine {
   private outstanding = 0;
   private destroyed = false;
   private audioCtx: AudioContext | null = null;
-  private morphDriver = new MorphDriver();
 
   constructor(container: HTMLElement, events: EngineEvents = {}) {
     this.container = container;
@@ -110,7 +108,6 @@ export class AvatarEngine {
     });
 
     this.ensureLipsync();
-    this.attachMorphDriver();
     this.logLipsyncReadiness("after-showAvatar");
 
     if (!this.destroyed && this.head) {
@@ -121,7 +118,6 @@ export class AvatarEngine {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.morphDriver.detach();
     lipDebug("destroy: begin teardown");
     try {
       this.head?.stopSpeaking();
@@ -216,6 +212,7 @@ export class AvatarEngine {
 
   enqueueDecodedAudio(item: QueueItem): void {
     if (this.destroyed || !this.head) return;
+    this.ensureRuntimeReady();
     this.beginSpeech();
     this.ensureLipsync();
     lipDebug("enqueueDecodedAudio", {
@@ -236,13 +233,12 @@ export class AvatarEngine {
       return;
     }
 
-    this.head.speakAudio({ audio: item.audio }, { lipsyncLang: "en", isRaw: true });
+    this.head.speakAudio({ audio: item.audio }, { lipsyncLang: "en" });
     window.setTimeout(() => this.endSpeech(), item.durationMs);
   }
 
   /**
-   * Word timings → English lipsync + captions via TalkingHead (same clock as audio).
-   * isRaw: skip resetLips / gesture so streamed chunks keep the mouth pose.
+   * Word timings → English lipsync and subtitles via TalkingHead.
    */
   private speakWordTimedAudio(
     audio: AudioBuffer | ArrayBuffer | ArrayBuffer[],
@@ -251,6 +247,7 @@ export class AvatarEngine {
     onEnd?: () => void,
   ): void {
     if (!this.head) return;
+    this.ensureRuntimeReady();
     const sample = Math.min(3, plan.words.length);
     const timelineEnd =
       plan.words.length > 0
@@ -270,32 +267,21 @@ export class AvatarEngine {
       audioType: Array.isArray(audio) ? "pcm-array" : "audio-buffer",
     });
 
-    // We pass `words` so TalkingHead's marker callback (onEnd) still fires on
-    // its audio clock, but we also pass an empty `visemes` array so TH skips its
-    // built-in words→viseme generation. That leaves the mesh's
-    // morphTargetInfluences entirely under our MorphDriver — no race.
     const payload: SpeakAudioPayload = {
       audio,
       words: plan.words,
       wtimes: plan.wtimes,
       wdurations: plan.wdurations,
-      visemes: [],
-      vtimes: [],
-      vdurations: [],
     };
     if (onEnd) {
       payload.markers = [onEnd];
       payload.mtimes = [Math.max(0, durationMs - 10)];
     }
 
-    this.head.speakAudio(payload, { lipsyncLang: "en" });
-
-    // Drive the actual mouth ourselves; TH's morph layer ramps too slowly for
-    // visemes on this model, so we write directly to mesh.morphTargetInfluences.
-    this.morphDriver.play(plan, durationMs, (word) => {
+    this.head.speakAudio(payload, { lipsyncLang: "en" }, (word) => {
       const t = word.trim();
       if (!t) return;
-      lipDebug("driver word", { word: t });
+      lipDebug("subtitle callback", { word: t });
       this.events.onSubtitle?.(t);
     });
   }
@@ -359,6 +345,18 @@ export class AvatarEngine {
     return new Ctor({ sampleRate: PCM_SAMPLE_RATE });
   }
 
+  private ensureRuntimeReady(): void {
+    if (!this.head) return;
+    const headAny = this.head as {
+      isRunning?: boolean;
+      start?: () => void;
+    };
+    if (headAny.isRunning === false) {
+      lipDebug("ensureRuntimeReady: restarting TalkingHead loop");
+      headAny.start?.();
+    }
+  }
+
   private logLipsyncReadiness(stage: string): void {
     if (!this.head) return;
     const headAny = this.head as {
@@ -388,20 +386,7 @@ export class AvatarEngine {
     });
   }
 
-  private attachMorphDriver(): void {
-    if (!this.head) return;
-    const headAny = this.head as {
-      morphs?: Array<{
-        morphTargetDictionary?: Record<string, number>;
-        morphTargetInfluences?: number[];
-      }>;
-    };
-    const meshes = headAny.morphs ?? [];
-    this.morphDriver.attach(meshes);
-  }
-
   stopSpeaking(): void {
-    this.morphDriver.stop();
     try {
       window.speechSynthesis?.cancel();
     } catch {
@@ -425,9 +410,8 @@ export class AvatarEngine {
     this.outstanding += 1;
     if (this.outstanding === 1) {
       this.events.onSpeakStart?.();
-      if (this.currentClip !== "talk") {
-        void this.playClip("talk", { loop: true });
-      }
+      // Keep the current body clip while speaking. A separate looping "talk"
+      // FBX can include facial/morph tracks that override TalkingHead visemes.
     }
   }
 
@@ -435,9 +419,6 @@ export class AvatarEngine {
     this.outstanding = Math.max(0, this.outstanding - 1);
     if (this.outstanding === 0) {
       this.events.onQueueDrain?.();
-      if (!this.destroyed && this.currentClip === "talk") {
-        void this.playClip("idle", { loop: true });
-      }
     }
   }
 }
